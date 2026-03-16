@@ -697,6 +697,8 @@ PAGE_TEMPLATE = r"""
   let selectedColor = '#f8fafc';
   let drawing = false;
   let currentStroke = null;
+  let erasing = false;
+  let eraserPoints = [];
   let saveTimer = null;
   let isDirty = false;
   let isSaving = false;
@@ -875,19 +877,61 @@ PAGE_TEMPLATE = r"""
   }
 
   function beginStroke(event) {
-    if (!['pen', 'marker', 'eraser'].includes(selectedTool)) return;
+    if (!['pen', 'marker'].includes(selectedTool)) return;
     drawing = true;
     const p = pointFromEvent(event);
     currentStroke = {
       id: uid(),
       tool: selectedTool,
-      color: selectedTool === 'eraser' ? '#10172c' : selectedColor,
+      color: selectedColor,
       width: strokeWidth(selectedTool),
       points: [p],
       opacity: selectedTool === 'marker' ? 0.35 : 1,
     };
     state.strokes.push(currentStroke);
     renderStroke(currentStroke);
+  }
+
+  function pointNearStroke(point, stroke, radius) {
+    const threshold = radius + (stroke.width || 0) / 2;
+    const thresholdSq = threshold * threshold;
+    return stroke.points.some(strokePoint => {
+      const dx = strokePoint.x - point.x;
+      const dy = strokePoint.y - point.y;
+      return (dx * dx + dy * dy) <= thresholdSq;
+    });
+  }
+
+  function eraseAtPoint(point) {
+    const radius = strokeWidth('eraser') / 2;
+    const before = state.strokes.length;
+    state.strokes = state.strokes.filter(stroke => !pointNearStroke(point, stroke, radius));
+    if (state.strokes.length !== before) {
+      renderAll();
+      return true;
+    }
+    return false;
+  }
+
+  function beginErase(event) {
+    erasing = true;
+    eraserPoints = [];
+    const p = pointFromEvent(event);
+    eraserPoints.push(p);
+    if (eraseAtPoint(p)) scheduleSave();
+  }
+
+  function continueErase(event) {
+    if (!erasing) return;
+    const p = pointFromEvent(event);
+    eraserPoints.push(p);
+    if (eraseAtPoint(p)) scheduleSave();
+  }
+
+  function endErase() {
+    if (!erasing) return;
+    erasing = false;
+    eraserPoints = [];
   }
 
   function continueStroke(event) {
@@ -945,6 +989,24 @@ PAGE_TEMPLATE = r"""
 
   function clearSelections() {
     objectsLayer.querySelectorAll('.selected').forEach(el => el.classList.remove('selected'));
+  }
+
+  function deleteSelectedObjects() {
+    const selectedIds = [...objectsLayer.querySelectorAll('.asset.selected, .text-box.selected')]
+      .map(el => el.dataset.id)
+      .filter(Boolean);
+    if (!selectedIds.length) return 0;
+    const selectedSet = new Set(selectedIds);
+    const textBefore = state.texts.length;
+    const assetsBefore = state.assets.length;
+    state.texts = state.texts.filter(item => !selectedSet.has(item.id));
+    state.assets = state.assets.filter(item => !selectedSet.has(item.id));
+    const deleted = (textBefore - state.texts.length) + (assetsBefore - state.assets.length);
+    if (deleted > 0) {
+      renderAll();
+      scheduleSave();
+    }
+    return deleted;
   }
 
   function renderText(item) {
@@ -1125,7 +1187,12 @@ PAGE_TEMPLATE = r"""
     }
     if (event.target.closest('.asset, .text-box')) return;
     clearSelections();
-    if (['pen', 'marker', 'eraser'].includes(selectedTool)) {
+    if (selectedTool === 'eraser') {
+      beginErase(event);
+      event.preventDefault();
+      return;
+    }
+    if (['pen', 'marker'].includes(selectedTool)) {
       beginStroke(event);
       event.preventDefault();
       return;
@@ -1137,8 +1204,11 @@ PAGE_TEMPLATE = r"""
   });
 
   viewport.addEventListener('pointermove', continueStroke);
+  viewport.addEventListener('pointermove', continueErase);
   window.addEventListener('pointerup', endStroke);
+  window.addEventListener('pointerup', endErase);
   viewport.addEventListener('pointerleave', endStroke);
+  viewport.addEventListener('pointerleave', endErase);
   viewport.addEventListener('contextmenu', (event) => event.preventDefault());
 
   document.querySelectorAll('[data-tool]').forEach(btn => btn.addEventListener('click', () => activateTool(btn.dataset.tool)));
@@ -1206,6 +1276,19 @@ PAGE_TEMPLATE = r"""
     if (event.code === 'Space' && !event.repeat) {
       panKeyDown = true;
       boardWrap.classList.add('is-panning');
+      event.preventDefault();
+      return;
+    }
+
+    if (event.key !== 'Delete' && event.key !== 'Backspace') return;
+    const activeEl = document.activeElement;
+    const isTyping = activeEl && (
+      activeEl.tagName === 'INPUT'
+      || activeEl.tagName === 'TEXTAREA'
+      || activeEl.isContentEditable
+    );
+    if (isTyping) return;
+    if (deleteSelectedObjects() > 0) {
       event.preventDefault();
     }
   });
