@@ -1,4 +1,4 @@
-# BoardBin
+# Boardbin
 
 A single-file Python web app that creates persistent whiteboard-style boards at UUID URLs.
 

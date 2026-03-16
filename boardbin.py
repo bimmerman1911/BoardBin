@@ -263,6 +263,28 @@ def upload_to_board(board_id: str) -> Response:
     )
 
 
+@app.post("/api/board/<board_id>/clear")
+def clear_board(board_id: str) -> Response:
+    ensure_board(board_id)
+    db = get_db()
+    file_rows = db.execute("SELECT stored_name FROM files WHERE board_id = ?", (board_id,)).fetchall()
+
+    for row in file_rows:
+        (UPLOAD_DIR / row["stored_name"]).unlink(missing_ok=True)
+
+    ts = now_iso()
+    reset_state = json.dumps(default_state(board_id))
+    db.execute("DELETE FROM files WHERE board_id = ?", (board_id,))
+    db.execute(
+        "UPDATE boards SET state_json = ?, version = version + 1, updated_at = ? WHERE id = ?",
+        (reset_state, ts, board_id),
+    )
+    db.commit()
+
+    row = db.execute("SELECT version FROM boards WHERE id = ?", (board_id,)).fetchone()
+    return jsonify({"ok": True, "version": row["version"], "updatedAt": ts})
+
+
 @app.get("/files/<file_id>")
 def download_file(file_id: str) -> Response:
     db = get_db()
@@ -284,7 +306,7 @@ PAGE_TEMPLATE = r"""
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>Studio Board</title>
+  <title>Boardbin</title>
   <style>
     :root {
       --bg: #0b1020;
@@ -367,7 +389,19 @@ PAGE_TEMPLATE = r"""
       box-shadow: var(--shadow);
       z-index: 10;
     }
-    .brand { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+    .brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
+    .brand-logo {
+      width: 40px;
+      height: 40px;
+      border-radius: 14px;
+      background: linear-gradient(135deg, rgba(124,156,255,.28), rgba(139,92,246,.36));
+      border: 1px solid rgba(255,255,255,.16);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,.18), 0 8px 20px rgba(0,0,0,.2);
+      display: grid;
+      place-items: center;
+      flex: 0 0 auto;
+    }
+    .brand-stack { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
     .brand h1 { margin: 0; font-size: 18px; font-weight: 700; letter-spacing: -.02em; }
     .brand p { margin: 0; color: var(--muted); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .status-wrap { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
@@ -593,8 +627,17 @@ PAGE_TEMPLATE = r"""
     <main class="main">
       <header class="topbar">
         <div class="brand">
-          <h1>Studio Board</h1>
-          <p>Board URL: <span id="boardUrl"></span></p>
+          <div class="brand-logo" aria-hidden="true">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <rect x="4" y="4" width="16" height="16" rx="4" stroke="white" stroke-opacity="0.85" stroke-width="1.4"/>
+              <path d="M8.2 8.7H12.9C14.9 8.7 16.3 9.8 16.3 11.7C16.3 13.6 14.9 14.8 12.9 14.8H8.2V8.7Z" fill="white" fill-opacity="0.9"/>
+              <path d="M8.2 15.5H13.2C15.2 15.5 16.6 16.4 16.6 18.1C16.6 19.9 15.2 20.8 13.2 20.8H8.2V15.5Z" fill="white" fill-opacity="0.5"/>
+            </svg>
+          </div>
+          <div class="brand-stack">
+            <h1>Boardbin</h1>
+            <p>Board URL: <span id="boardUrl"></span></p>
+          </div>
         </div>
         <div class="status-wrap">
           <div class="status"><span class="dot"></span><span id="statusText">Loading…</span></div>
@@ -1114,13 +1157,25 @@ PAGE_TEMPLATE = r"""
     scheduleSave();
   });
 
-  document.getElementById('clearBtn').addEventListener('click', () => {
+  document.getElementById('clearBtn').addEventListener('click', async () => {
     if (!confirm('Clear the whole board?')) return;
-    state.strokes = [];
-    state.texts = [];
-    state.assets = [];
-    renderAll();
-    scheduleSave();
+    setStatus('Clearing board…');
+    try {
+      const res = await fetch(`/api/board/${BOARD_ID}/clear`, { method: 'POST' });
+      const payload = await res.json();
+      if (!res.ok) throw new Error(payload.error || 'Failed to clear board');
+      version = payload.version;
+      lastAppliedVersion = version;
+      isDirty = false;
+      state.strokes = [];
+      state.texts = [];
+      state.assets = [];
+      renderAll();
+      setStatus('Board cleared');
+    } catch (err) {
+      console.error(err);
+      setStatus(`Clear failed: ${err.message}`);
+    }
   });
 
   document.getElementById('centerBtn').addEventListener('click', () => {
