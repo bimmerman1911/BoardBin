@@ -5,7 +5,7 @@ import mimetypes
 import os
 import sqlite3
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -61,6 +61,8 @@ ENV_SETTINGS = load_env_settings(BASE_DIR / ".env")
 HOST = os.environ.get("HOST", ENV_SETTINGS.get("HOST", "0.0.0.0"))
 PORT = int(os.environ.get("PORT", ENV_SETTINGS.get("PORT", "8000")))
 DEBUG = parse_bool(os.environ.get("DEBUG", ENV_SETTINGS.get("DEBUG", "0")))
+MAX_CONCURRENT_USERS = int(os.environ.get("MAX_CONCURRENT_USERS", ENV_SETTINGS.get("MAX_CONCURRENT_USERS", "25")))
+PRESENCE_TTL_SECONDS = int(os.environ.get("PRESENCE_TTL_SECONDS", ENV_SETTINGS.get("PRESENCE_TTL_SECONDS", "45")))
 
 
 def get_db() -> sqlite3.Connection:
@@ -104,6 +106,17 @@ def init_db() -> None:
             FOREIGN KEY(board_id) REFERENCES boards(id) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_files_board_id ON files(board_id);
+
+        CREATE TABLE IF NOT EXISTS board_sessions (
+            board_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            PRIMARY KEY (board_id, session_id),
+            FOREIGN KEY(board_id) REFERENCES boards(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_board_sessions_board_id ON board_sessions(board_id);
+        CREATE INDEX IF NOT EXISTS idx_board_sessions_expires_at ON board_sessions(expires_at);
         """
     )
     conn.commit()
@@ -112,6 +125,19 @@ def init_db() -> None:
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def expiry_iso() -> str:
+    return (datetime.now(timezone.utc) + timedelta(seconds=PRESENCE_TTL_SECONDS)).isoformat()
+
+
+def prune_expired_sessions(db: sqlite3.Connection) -> None:
+    db.execute("DELETE FROM board_sessions WHERE expires_at < ?", (now_iso(),))
+
+
+def active_user_count(db: sqlite3.Connection, board_id: str) -> int:
+    row = db.execute("SELECT COUNT(*) AS total FROM board_sessions WHERE board_id = ?", (board_id,)).fetchone()
+    return int(row["total"] if row else 0)
 
 
 init_db()
@@ -177,15 +203,64 @@ def board_page(board_id: str) -> str:
 @app.get("/api/board/<board_id>")
 def get_board_state(board_id: str) -> Response:
     board = ensure_board(board_id)
+    db = get_db()
+    prune_expired_sessions(db)
+    db.commit()
     state = json.loads(board["state_json"])
     return jsonify(
         {
             "boardId": board_id,
             "version": board["version"],
             "updatedAt": board["updated_at"],
+            "activeUsers": active_user_count(db, board_id),
             "state": state,
         }
     )
+
+
+@app.post("/api/board/<board_id>/presence")
+def board_presence(board_id: str) -> Response:
+    ensure_board(board_id)
+    payload = request.get_json(silent=True) or {}
+    session_id = str(payload.get("sessionId", "")).strip()
+    if not session_id:
+        return jsonify({"error": "Missing sessionId."}), 400
+
+    db = get_db()
+    prune_expired_sessions(db)
+    existing = db.execute(
+        "SELECT 1 FROM board_sessions WHERE board_id = ? AND session_id = ?",
+        (board_id, session_id),
+    ).fetchone()
+    count = active_user_count(db, board_id)
+
+    if existing is None and count >= MAX_CONCURRENT_USERS:
+        return jsonify({"error": f"Board is full ({MAX_CONCURRENT_USERS} concurrent users).", "maxUsers": MAX_CONCURRENT_USERS}), 429
+
+    ts = now_iso()
+    db.execute(
+        """
+        INSERT INTO board_sessions(board_id, session_id, last_seen_at, expires_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(board_id, session_id)
+        DO UPDATE SET last_seen_at = excluded.last_seen_at, expires_at = excluded.expires_at
+        """,
+        (board_id, session_id, ts, expiry_iso()),
+    )
+    db.commit()
+    return jsonify({"ok": True, "activeUsers": active_user_count(db, board_id), "maxUsers": MAX_CONCURRENT_USERS})
+
+
+@app.post("/api/board/<board_id>/presence/leave")
+def board_presence_leave(board_id: str) -> Response:
+    ensure_board(board_id)
+    payload = request.get_json(silent=True) or {}
+    session_id = str(payload.get("sessionId", "")).strip()
+    if session_id:
+        db = get_db()
+        db.execute("DELETE FROM board_sessions WHERE board_id = ? AND session_id = ?", (board_id, session_id))
+        db.commit()
+    return jsonify({"ok": True})
 
 
 @app.post("/api/board/<board_id>/save")
@@ -641,6 +716,7 @@ PAGE_TEMPLATE = r"""
         </div>
         <div class="status-wrap">
           <div class="status"><span class="dot"></span><span id="statusText">Loading…</span></div>
+          <div class="status" id="presenceText">👥 0 online</div>
           <div class="status zoom-chip" id="zoomChip">100%</div>
         </div>
       </header>
@@ -667,6 +743,7 @@ PAGE_TEMPLATE = r"""
   const BOARD_ID = {{ board_id|tojson }};
   const SAVE_DEBOUNCE_MS = 700;
   const POLL_MS = 4000;
+  const PRESENCE_HEARTBEAT_MS = 15000;
   const WORLD_WIDTH = 12000;
   const WORLD_HEIGHT = 12000;
   const DEFAULT_VIEW = { x: WORLD_WIDTH / 2, y: WORLD_HEIGHT / 2, zoom: 1 };
@@ -680,6 +757,7 @@ PAGE_TEMPLATE = r"""
   const dropHint = document.getElementById('dropHint');
   const boardUrl = document.getElementById('boardUrl');
   const zoomChip = document.getElementById('zoomChip');
+  const presenceText = document.getElementById('presenceText');
   const gridLayer = document.getElementById('gridLayer');
   boardUrl.textContent = window.location.href;
 
@@ -705,9 +783,22 @@ PAGE_TEMPLATE = r"""
   let lastAppliedVersion = 0;
   let interaction = null;
   let panKeyDown = false;
+  const sessionId = (() => {
+    const key = `boardbin-session-${BOARD_ID}`;
+    const existing = window.sessionStorage.getItem(key);
+    if (existing) return existing;
+    const created = uid();
+    window.sessionStorage.setItem(key, created);
+    return created;
+  })();
 
   function setStatus(text) {
     statusText.textContent = text;
+  }
+
+  function setPresence(users, maxUsers = null) {
+    if (!Number.isFinite(users)) return;
+    presenceText.textContent = maxUsers ? `👥 ${users} online · max ${maxUsers}` : `👥 ${users} online`;
   }
 
   function uid() {
@@ -841,6 +932,7 @@ PAGE_TEMPLATE = r"""
     const payload = await res.json();
     version = payload.version;
     lastAppliedVersion = payload.version;
+    setPresence(payload.activeUsers || 0);
     Object.assign(state, payload.state);
     state.viewport = normalizeViewport(payload.state.viewport);
     if (!payload.state.viewport || (!payload.state.viewport.zoom && !payload.state.viewport.x && !payload.state.viewport.y)) {
@@ -856,6 +948,7 @@ PAGE_TEMPLATE = r"""
     try {
       const res = await fetch(`/api/board/${BOARD_ID}`);
       const payload = await res.json();
+      setPresence(payload.activeUsers || 0);
       if (payload.version > lastAppliedVersion) {
         version = payload.version;
         lastAppliedVersion = payload.version;
@@ -867,6 +960,26 @@ PAGE_TEMPLATE = r"""
       }
     } catch (err) {
       console.error('Poll failed', err);
+    }
+  }
+
+  async function sendPresenceHeartbeat() {
+    try {
+      const res = await fetch(`/api/board/${BOARD_ID}/presence`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId }),
+      });
+      const payload = await res.json();
+      if (!res.ok) {
+        throw new Error(payload.error || 'Presence check failed');
+      }
+      setPresence(payload.activeUsers, payload.maxUsers);
+    } catch (err) {
+      console.error(err);
+      if (String(err.message || '').includes('Board is full')) {
+        alert(err.message);
+      }
     }
   }
 
@@ -1012,7 +1125,8 @@ PAGE_TEMPLATE = r"""
   function renderText(item) {
     const div = document.createElement('div');
     div.className = 'text-box';
-    div.contentEditable = 'true';
+    div.contentEditable = 'false';
+    div.dataset.editing = 'false';
     div.dataset.id = item.id;
     div.style.left = `${item.x}px`;
     div.style.top = `${item.y}px`;
@@ -1020,11 +1134,18 @@ PAGE_TEMPLATE = r"""
     div.style.minHeight = `${item.height || 56}px`;
     div.textContent = item.text || '';
     div.addEventListener('input', () => {
+      if (div.dataset.editing !== 'true') return;
       item.text = div.textContent;
       item.height = div.offsetHeight;
       item.width = div.offsetWidth;
       scheduleSave();
     });
+    div.addEventListener('dblclick', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      startEditingText(div, item, false);
+    });
+    div.addEventListener('blur', () => stopEditingText(div, item));
     div.addEventListener('focus', () => {
       clearSelections();
       div.classList.add('selected');
@@ -1077,6 +1198,7 @@ PAGE_TEMPLATE = r"""
     el.addEventListener('pointerdown', (event) => {
       if (event.target.closest('.resize-handle')) return;
       if (event.target.tagName === 'A') return;
+      if (el.dataset.editing === 'true') return;
       if (!['select', 'text'].includes(selectedTool)) return;
       clearSelections();
       el.classList.add('selected');
@@ -1119,14 +1241,38 @@ PAGE_TEMPLATE = r"""
     scheduleSave();
     const el = objectsLayer.querySelector(`.text-box[data-id="${item.id}"]`);
     if (el) {
-      el.focus();
-      const selection = window.getSelection();
-      const range = document.createRange();
-      range.selectNodeContents(el);
-      range.collapse(true);
-      selection.removeAllRanges();
-      selection.addRange(range);
+      startEditingText(el, item, true);
     }
+  }
+
+  function placeCaret(el, toStart = false) {
+    const selection = window.getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    range.collapse(toStart);
+    selection.removeAllRanges();
+    selection.addRange(range);
+  }
+
+  function startEditingText(el, item, toStart = false) {
+    el.contentEditable = 'true';
+    el.dataset.editing = 'true';
+    clearSelections();
+    el.classList.add('selected');
+    el.focus();
+    placeCaret(el, toStart);
+    item.width = el.offsetWidth;
+    item.height = el.offsetHeight;
+  }
+
+  function stopEditingText(el, item) {
+    if (el.dataset.editing !== 'true') return;
+    el.dataset.editing = 'false';
+    el.contentEditable = 'false';
+    item.text = el.textContent;
+    item.width = el.offsetWidth;
+    item.height = el.offsetHeight;
+    scheduleSave();
   }
 
   function beginPan(event) {
@@ -1358,12 +1504,15 @@ PAGE_TEMPLATE = r"""
   });
 
   window.addEventListener('beforeunload', () => {
+    navigator.sendBeacon(`/api/board/${BOARD_ID}/presence/leave`, new Blob([JSON.stringify({ sessionId })], { type: 'application/json' }));
     if (isDirty) {
       navigator.sendBeacon(`/api/board/${BOARD_ID}/save`, new Blob([JSON.stringify({ state, version })], { type: 'application/json' }));
     }
   });
 
   loadBoard();
+  sendPresenceHeartbeat();
+  setInterval(sendPresenceHeartbeat, PRESENCE_HEARTBEAT_MS);
   setInterval(pollForUpdates, POLL_MS);
 })();
 </script>
