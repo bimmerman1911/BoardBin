@@ -23,6 +23,7 @@ from flask import (
 )
 from werkzeug.utils import secure_filename
 
+
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 UPLOAD_DIR = DATA_DIR / "uploads"
@@ -36,6 +37,30 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_FILE_SIZE
+
+
+def load_env_settings(env_path: Path) -> dict[str, str]:
+    settings: dict[str, str] = {}
+    if not env_path.exists():
+        return settings
+
+    for raw_line in env_path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        settings[key.strip()] = value.strip().strip("\"'")
+    return settings
+
+
+def parse_bool(value: str) -> bool:
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+ENV_SETTINGS = load_env_settings(BASE_DIR / ".env")
+HOST = os.environ.get("HOST", ENV_SETTINGS.get("HOST", "0.0.0.0"))
+PORT = int(os.environ.get("PORT", ENV_SETTINGS.get("PORT", "8000")))
+DEBUG = parse_bool(os.environ.get("DEBUG", ENV_SETTINGS.get("DEBUG", "0")))
 
 
 def get_db() -> sqlite3.Connection:
@@ -1210,7 +1235,4 @@ PAGE_TEMPLATE = r"""
 
 
 if __name__ == "__main__":
-    host = os.environ.get("HOST", "0.0.0.0")
-    port = int(os.environ.get("PORT", "8000"))
-    debug = os.environ.get("DEBUG", "0") == "1"
-    app.run(host=host, port=port, debug=debug)
+    app.run(host=HOST, port=PORT, debug=DEBUG)
