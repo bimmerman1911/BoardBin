@@ -21,10 +21,13 @@ A single-file Python web app that creates persistent whiteboard-style boards at 
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-python app.py
+cp .env.example .env
+python boardbin.py
 ```
 
 Then open `http://YOUR_SERVER:8000/`.
+
+You can change host/port/debug values in `.env`.
 
 ## Storage
 
@@ -41,5 +44,5 @@ Keep the `data/` directory if you want boards and uploads to survive restarts or
 - For production, run behind a reverse proxy such as Nginx and use Gunicorn:
 
 ```bash
-gunicorn -w 2 -b 0.0.0.0:8000 app:app
+gunicorn -w 2 -b 0.0.0.0:8000 boardbin:app
 ```
