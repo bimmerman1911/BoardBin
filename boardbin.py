@@ -117,6 +117,17 @@ def init_db() -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_board_sessions_board_id ON board_sessions(board_id);
         CREATE INDEX IF NOT EXISTS idx_board_sessions_expires_at ON board_sessions(expires_at);
+
+        CREATE TABLE IF NOT EXISTS chat_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            board_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            author_name TEXT NOT NULL,
+            message_text TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(board_id) REFERENCES boards(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_chat_messages_board_id_id ON chat_messages(board_id, id);
         """
     )
     conn.commit()
@@ -350,6 +361,7 @@ def clear_board(board_id: str) -> Response:
     ts = now_iso()
     reset_state = json.dumps(default_state(board_id))
     db.execute("DELETE FROM files WHERE board_id = ?", (board_id,))
+    db.execute("DELETE FROM chat_messages WHERE board_id = ?", (board_id,))
     db.execute(
         "UPDATE boards SET state_json = ?, version = version + 1, updated_at = ? WHERE id = ?",
         (reset_state, ts, board_id),
@@ -358,6 +370,72 @@ def clear_board(board_id: str) -> Response:
 
     row = db.execute("SELECT version FROM boards WHERE id = ?", (board_id,)).fetchone()
     return jsonify({"ok": True, "version": row["version"], "updatedAt": ts})
+
+
+@app.get("/api/board/<board_id>/chat")
+def get_chat_messages(board_id: str) -> Response:
+    ensure_board(board_id)
+    after_id = request.args.get("after", "0")
+    try:
+        after = max(0, int(after_id))
+    except ValueError:
+        return jsonify({"error": "Invalid 'after' value."}), 400
+
+    db = get_db()
+    rows = db.execute(
+        """
+        SELECT id, author_name, message_text, created_at
+        FROM chat_messages
+        WHERE board_id = ? AND id > ?
+        ORDER BY id ASC
+        LIMIT 120
+        """,
+        (board_id, after),
+    ).fetchall()
+    messages = [
+        {
+            "id": int(row["id"]),
+            "author": row["author_name"],
+            "message": row["message_text"],
+            "createdAt": row["created_at"],
+        }
+        for row in rows
+    ]
+    latest_id = messages[-1]["id"] if messages else after
+    return jsonify({"messages": messages, "latestId": latest_id})
+
+
+@app.post("/api/board/<board_id>/chat")
+def post_chat_message(board_id: str) -> Response:
+    ensure_board(board_id)
+    payload = request.get_json(silent=True) or {}
+    session_id = str(payload.get("sessionId", "")).strip()
+    author = str(payload.get("author", "")).strip()
+    message = str(payload.get("message", "")).strip()
+
+    if not session_id:
+        return jsonify({"error": "Missing sessionId."}), 400
+    if not author:
+        return jsonify({"error": "Missing author."}), 400
+    if not message:
+        return jsonify({"error": "Message cannot be empty."}), 400
+    if len(author) > 32:
+        return jsonify({"error": "Author is too long."}), 400
+    if len(message) > 500:
+        return jsonify({"error": "Message is too long (max 500 chars)."}), 400
+
+    db = get_db()
+    ts = now_iso()
+    row = db.execute(
+        """
+        INSERT INTO chat_messages(board_id, session_id, author_name, message_text, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        RETURNING id
+        """,
+        (board_id, session_id, author, message, ts),
+    ).fetchone()
+    db.commit()
+    return jsonify({"ok": True, "message": {"id": int(row["id"]), "author": author, "message": message, "createdAt": ts}})
 
 
 @app.get("/files/<file_id>")
@@ -635,22 +713,74 @@ PAGE_TEMPLATE = r"""
       justify-content: center;
       font-variant-numeric: tabular-nums;
     }
-    .instructions {
+    .chatbox {
       position: absolute;
       right: 18px;
       bottom: 18px;
-      padding: 14px 16px;
+      width: min(360px, calc(100% - 36px));
+      max-height: min(320px, calc(100% - 36px));
       border-radius: 18px;
-      background: rgba(8,11,19,.76);
-      border: 1px solid rgba(255,255,255,.08);
+      background: rgba(8,11,19,.8);
+      border: 1px solid rgba(255,255,255,.1);
       color: var(--muted);
       font-size: 13px;
-      line-height: 1.5;
-      max-width: 360px;
       backdrop-filter: blur(14px);
-      z-index: 5;
+      z-index: 12;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
     }
-    .instructions b { color: var(--text); }
+    .chat-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 10px 12px;
+      border-bottom: 1px solid rgba(255,255,255,.08);
+      color: var(--text);
+      font-weight: 600;
+    }
+    .chat-header small { color: var(--muted); font-weight: 500; }
+    .chat-log {
+      padding: 10px 12px;
+      overflow-y: auto;
+      min-height: 120px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .chat-empty { color: var(--muted); font-size: 12px; }
+    .chat-item { display: grid; gap: 2px; }
+    .chat-meta { color: #c9d3e6; font-size: 12px; }
+    .chat-text { color: var(--text); white-space: pre-wrap; word-break: break-word; }
+    .chat-form {
+      display: flex;
+      gap: 8px;
+      padding: 10px;
+      border-top: 1px solid rgba(255,255,255,.08);
+      background: rgba(255,255,255,.02);
+    }
+    .chat-input {
+      flex: 1;
+      min-width: 0;
+      border-radius: 12px;
+      border: 1px solid rgba(255,255,255,.14);
+      background: rgba(7,10,17,.9);
+      color: var(--text);
+      font-size: 13px;
+      padding: 8px 10px;
+      outline: none;
+    }
+    .chat-input:focus { border-color: rgba(124,156,255,.6); }
+    .chat-send {
+      border: 1px solid rgba(124,156,255,.35);
+      background: rgba(124,156,255,.25);
+      color: var(--text);
+      border-radius: 12px;
+      font-size: 13px;
+      padding: 8px 12px;
+      cursor: pointer;
+    }
     @media (max-width: 920px) {
       .shell {
         grid-template-columns: 1fr;
@@ -669,7 +799,7 @@ PAGE_TEMPLATE = r"""
       .swatch { width: 28px; height: 28px; }
       .topbar { padding: 14px 16px; border-radius: 20px; align-items: flex-start; flex-direction: column; }
       .brand p { white-space: normal; }
-      .instructions { max-width: 260px; font-size: 12px; }
+      .chatbox { width: min(300px, calc(100% - 24px)); bottom: 12px; right: 12px; }
       .status-wrap { justify-content: flex-start; }
     }
   </style>
@@ -730,9 +860,18 @@ PAGE_TEMPLATE = r"""
             <div class="layer" id="objectsLayer"></div>
           </div>
         </div>
-        <div class="instructions">
-          <b>Tips</b><br>
-          Hold <b>space</b> and drag to pan. Use the mouse wheel or pinch to zoom. Click with the text tool to place notes. Drag files onto the board. Maximum upload size: {{ max_file_size_mb }} MB.
+        <div class="chatbox" aria-label="Board chat">
+          <div class="chat-header">
+            <span>Chat</span>
+            <small id="chatIdentity"></small>
+          </div>
+          <div class="chat-log" id="chatLog">
+            <div class="chat-empty">Chat lives for this board and resets when the board is cleared.</div>
+          </div>
+          <form class="chat-form" id="chatForm">
+            <input class="chat-input" id="chatInput" maxlength="500" placeholder="Message everyone on this board" autocomplete="off" />
+            <button class="chat-send" type="submit">Send</button>
+          </form>
         </div>
       </section>
     </main>
@@ -743,6 +882,7 @@ PAGE_TEMPLATE = r"""
   const BOARD_ID = {{ board_id|tojson }};
   const SAVE_DEBOUNCE_MS = 700;
   const POLL_MS = 4000;
+  const CHAT_POLL_MS = 2000;
   const PRESENCE_HEARTBEAT_MS = 15000;
   const WORLD_WIDTH = 12000;
   const WORLD_HEIGHT = 12000;
@@ -759,6 +899,10 @@ PAGE_TEMPLATE = r"""
   const zoomChip = document.getElementById('zoomChip');
   const presenceText = document.getElementById('presenceText');
   const gridLayer = document.getElementById('gridLayer');
+  const chatLog = document.getElementById('chatLog');
+  const chatForm = document.getElementById('chatForm');
+  const chatInput = document.getElementById('chatInput');
+  const chatIdentity = document.getElementById('chatIdentity');
   boardUrl.textContent = window.location.href;
 
   const state = {
@@ -783,6 +927,20 @@ PAGE_TEMPLATE = r"""
   let lastAppliedVersion = 0;
   let interaction = null;
   let panKeyDown = false;
+  let lastChatId = 0;
+  let isSendingChat = false;
+
+  const userName = (() => {
+    const key = `boardbin-chat-name-${BOARD_ID}`;
+    const existing = window.sessionStorage.getItem(key);
+    if (existing) return existing;
+    const adjectives = ['Blue', 'Swift', 'Calm', 'Bright', 'Brave', 'Sunny', 'Quick', 'Merry', 'Clever', 'Cosmic'];
+    const animals = ['Otter', 'Fox', 'Panda', 'Lynx', 'Hawk', 'Koala', 'Dolphin', 'Raven', 'Tiger', 'Falcon'];
+    const name = `${adjectives[Math.floor(Math.random() * adjectives.length)]}${animals[Math.floor(Math.random() * animals.length)]}${Math.floor(Math.random() * 90 + 10)}`;
+    window.sessionStorage.setItem(key, name);
+    return name;
+  })();
+  chatIdentity.textContent = `You are ${userName}`;
   const sessionId = (() => {
     const key = `boardbin-session-${BOARD_ID}`;
     const existing = window.sessionStorage.getItem(key);
@@ -799,6 +957,68 @@ PAGE_TEMPLATE = r"""
   function setPresence(users, maxUsers = null) {
     if (!Number.isFinite(users)) return;
     presenceText.textContent = maxUsers ? `👥 ${users} online · max ${maxUsers}` : `👥 ${users} online`;
+  }
+
+
+  function formatTime(iso) {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return '';
+    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  }
+
+  function appendChatMessage(item) {
+    const row = document.createElement('div');
+    row.className = 'chat-item';
+    row.dataset.id = item.id;
+    row.innerHTML = `<div class="chat-meta">${item.author} · ${formatTime(item.createdAt)}</div><div class="chat-text"></div>`;
+    row.querySelector('.chat-text').textContent = item.message;
+    chatLog.appendChild(row);
+    chatLog.scrollTop = chatLog.scrollHeight;
+  }
+
+  function clearChatIfReset() {
+    if (chatLog.querySelector('.chat-item')) {
+      chatLog.innerHTML = '<div class="chat-empty">Chat lives for this board and resets when the board is cleared.</div>';
+    }
+  }
+
+  async function fetchChatMessages() {
+    try {
+      const res = await fetch(`/api/board/${BOARD_ID}/chat?after=${lastChatId}`);
+      const payload = await res.json();
+      if (!res.ok) throw new Error(payload.error || 'Failed to load chat');
+      if (Array.isArray(payload.messages) && payload.messages.length) {
+        if (chatLog.querySelector('.chat-empty')) {
+          chatLog.innerHTML = '';
+        }
+        payload.messages.forEach(msg => appendChatMessage(msg));
+      }
+      if (Number.isFinite(payload.latestId)) {
+        lastChatId = Math.max(lastChatId, payload.latestId);
+      }
+    } catch (err) {
+      console.error('Chat poll failed', err);
+    }
+  }
+
+  async function sendChatMessage(text) {
+    if (isSendingChat) return;
+    isSendingChat = true;
+    try {
+      const res = await fetch(`/api/board/${BOARD_ID}/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId, author: userName, message: text }),
+      });
+      const payload = await res.json();
+      if (!res.ok) throw new Error(payload.error || 'Failed to send message');
+      chatInput.value = '';
+      await fetchChatMessages();
+    } catch (err) {
+      alert(`Chat: ${err.message}`);
+    } finally {
+      isSendingChat = false;
+    }
   }
 
   function uid() {
@@ -957,6 +1177,11 @@ PAGE_TEMPLATE = r"""
         renderAll();
         applyViewport();
         setStatus('Board refreshed');
+        if ((payload.state.strokes?.length || 0) === 0 && (payload.state.texts?.length || 0) === 0 && (payload.state.assets?.length || 0) === 0) {
+          lastChatId = 0;
+          clearChatIfReset();
+          fetchChatMessages();
+        }
       }
     } catch (err) {
       console.error('Poll failed', err);
@@ -1388,6 +1613,8 @@ PAGE_TEMPLATE = r"""
       state.assets = [];
       renderAll();
       setStatus('Board cleared');
+      chatLog.innerHTML = '<div class="chat-empty">Chat lives for this board and resets when the board is cleared.</div>';
+      lastChatId = 0;
     } catch (err) {
       console.error(err);
       setStatus(`Clear failed: ${err.message}`);
@@ -1503,6 +1730,13 @@ PAGE_TEMPLATE = r"""
     await uploadFiles(files, event);
   });
 
+  chatForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const text = chatInput.value.trim();
+    if (!text) return;
+    await sendChatMessage(text);
+  });
+
   window.addEventListener('beforeunload', () => {
     navigator.sendBeacon(`/api/board/${BOARD_ID}/presence/leave`, new Blob([JSON.stringify({ sessionId })], { type: 'application/json' }));
     if (isDirty) {
@@ -1511,9 +1745,11 @@ PAGE_TEMPLATE = r"""
   });
 
   loadBoard();
+  fetchChatMessages();
   sendPresenceHeartbeat();
   setInterval(sendPresenceHeartbeat, PRESENCE_HEARTBEAT_MS);
   setInterval(pollForUpdates, POLL_MS);
+  setInterval(fetchChatMessages, CHAT_POLL_MS);
 })();
 </script>
 </body>
