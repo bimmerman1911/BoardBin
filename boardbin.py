@@ -1646,7 +1646,15 @@ PAGE_TEMPLATE = r"""
   window.addEventListener('resize', applyViewport);
 
   window.addEventListener('keydown', (event) => {
+    const activeEl = document.activeElement;
+    const isTyping = activeEl && (
+      activeEl.tagName === 'INPUT'
+      || activeEl.tagName === 'TEXTAREA'
+      || activeEl.isContentEditable
+    );
+
     if (event.code === 'Space' && !event.repeat) {
+      if (isTyping) return;
       panKeyDown = true;
       boardWrap.classList.add('is-panning');
       event.preventDefault();
@@ -1654,12 +1662,6 @@ PAGE_TEMPLATE = r"""
     }
 
     if (event.key !== 'Delete' && event.key !== 'Backspace') return;
-    const activeEl = document.activeElement;
-    const isTyping = activeEl && (
-      activeEl.tagName === 'INPUT'
-      || activeEl.tagName === 'TEXTAREA'
-      || activeEl.isContentEditable
-    );
     if (isTyping) return;
     if (deleteSelectedObjects() > 0) {
       event.preventDefault();
